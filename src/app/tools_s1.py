@@ -13,6 +13,7 @@ functions for blocking calls (time.sleep, httpx.get/Client, requests, sqlite3.co
 Only the paths moved (data/ in this project, cache under 'session5-agent'). Charts are written to CHARTS_DIR
 and served by the API at /charts so the Gradio UI can show them.
 """
+import asyncio
 import json
 import os
 import re
@@ -27,6 +28,7 @@ import platformdirs
 from altair.utils.core import parse_shorthand
 import sqlglot
 import trafilatura
+import httpx
 from langchain_core.tools import tool
 from sqlglot import exp
 
@@ -85,7 +87,7 @@ def reject_unless_select_only(query: str) -> str | None:
 # Tool 1 — weather (toy, no real API — mirrors the slide's exact example)
 # ---------------------------------------------------------------------------
 @tool
-def get_weather(location: str) -> str:
+async def get_weather(location: str) -> str:
     """Get current weather for a location.
 
     Args:
@@ -98,66 +100,59 @@ def get_weather(location: str) -> str:
 # Tool 2 — web fetch -> clean markdown
 # ---------------------------------------------------------------------------
 @tool
-def web_fetch(url: str) -> str:
-    """Fetch a web page and return its main content as clean Markdown,
-    with navigation, ads, and boilerplate stripped out.
+async def web_fetch(url: str) -> str:
+    """Fetch a web page and return its main content as clean Markdown.
 
     Args:
-        url: Full URL of the page to fetch (e.g. https://example.com/article)
+        url: Full URL of the page to fetch.
     """
-    downloaded = trafilatura.fetch_url(url)
-    if not downloaded:
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+        downloaded = response.text
+    except Exception:
         return f"Could not fetch {url}"
-    markdown = trafilatura.extract(downloaded, output_format="markdown", with_metadata=True)
+    markdown = await asyncio.to_thread(
+        trafilatura.extract, downloaded, output_format="markdown", with_metadata=True
+    )
     if not markdown:
         return f"Fetched {url} but found no extractable article content."
-    return markdown[:8000]  # keep the demo output readable
+    return markdown[:8000]
 
 
 # ---------------------------------------------------------------------------
 # Tool 3 — SQL query against a toy database (read-only)
 # ---------------------------------------------------------------------------
-@tool
-def sql_query(database: str, query: str) -> str:
-    """Run a read-only SQL SELECT query against one of the toy databases.
-
-    Returns a JSON object: {"data_ref": ..., "row_count": ..., "preview": [...]}.
-    "preview" is just the first rows for you to read/summarize — to chart the
-    result, pass "data_ref" straight into make_chart's data_ref argument. Never
-    retype/regenerate the full row data yourself as a make_chart argument; for
-    anything more than a couple of rows that reliably produces a malformed tool
-    call (the JSON-in-JSON escaping is exactly the kind of thing LLMs get wrong).
-
-    Available databases:
-      - "chinook": a music store — Artist, Album, Track, Customer, Invoice, InvoiceLine, Genre, ...
-      - "northwind": a trading company — Customers, Orders, "Order Details", Products,
-        Suppliers, Employees, Categories, Shippers, ... (note: quote "Order Details",
-        it has a space in the table name; also group by CustomerID, not just
-        CompanyName — a couple of distinct customers share the placeholder name "IT")
-
-    Args:
-        database: one of "chinook", "northwind"
-        query: A single SQL SELECT statement. No INSERT/UPDATE/DELETE/DROP allowed.
-    """
+def _sql_query_sync(database: str, query: str) -> str:
     db_path = DATABASES.get(database)
     if db_path is None:
         return f"Unknown database '{database}'. Choose one of: {', '.join(DATABASES)}"
-
     rejection = reject_unless_select_only(query)
     if rejection:
         return rejection
-    stripped = query.strip().rstrip(";")
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
     try:
-        rows = con.execute(stripped).fetchall()
+        rows = con.execute(query.strip().rstrip(";")).fetchall()
     except sqlite3.Error as e:
         return f"SQL error: {e}"
     finally:
         con.close()
-    result = [dict(row) for row in rows[:200]]  # cap rows for the demo
+    result = [dict(row) for row in rows[:200]]
     ref = _cache_rows(result)
     return json.dumps({"data_ref": ref, "row_count": len(result), "preview": result[:20]}, default=str)
+
+
+@tool
+async def sql_query(database: str, query: str) -> str:
+    """Run a read-only SQL SELECT query against chinook or northwind.
+
+    Args:
+        database: one of chinook or northwind.
+        query: one read-only SELECT statement.
+    """
+    return await asyncio.to_thread(_sql_query_sync, database, query)
 
 
 # ---------------------------------------------------------------------------
